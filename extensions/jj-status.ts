@@ -24,6 +24,17 @@ function sanitizeStatusText(text: string): string {
 	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
 }
 
+/** Compact a jj bookmarks string: first bookmark only, last path segment, truncated */
+function compactBookmark(bookmarks: string, maxLen = 12): string {
+	if (!bookmarks) return "";
+	const first = bookmarks.split(/\s+/)[0];
+	const lastSegment = first.includes("/") ? first.split("/").pop()! : first;
+	if (lastSegment.length > maxLen) {
+		return lastSegment.slice(0, maxLen - 1) + "…";
+	}
+	return lastSegment;
+}
+
 export default function (pi: ExtensionAPI) {
 	let enabled = true;
 
@@ -81,7 +92,7 @@ export default function (pi: ExtensionAPI) {
 				isJjRepo = true;
 
 				// Compact jj status for @ (working copy):
-				//   bookmarks | change_id.shortest(8) | desc / conflict / empty
+				//   bookmarks | change_id.shortest(8)
 				const logResult = await pi
 					.exec(
 						"jj",
@@ -91,16 +102,23 @@ export default function (pi: ExtensionAPI) {
 							"@",
 							"--no-graph",
 							"--template",
-							'separate(" | ", bookmarks, change_id.shortest(8), if(conflict, "conflict", if(description, description.first_line(), "empty")))',
+							'separate(" | ", bookmarks, change_id.shortest(8))',
 						],
 						{ cwd: ctx.cwd, timeout: 3000 },
 					)
 					.catch(() => undefined);
 
+				let atBookmark = "";
+				let changeId = "";
 				if (logResult && logResult.code === 0) {
-					jjLine = logResult.stdout.trim();
-				} else {
-					jjLine = "";
+					const raw = logResult.stdout.trim();
+					const parts = raw.split(" | ");
+					if (parts.length > 1) {
+						atBookmark = parts[0];
+						changeId = parts[1];
+					} else {
+						changeId = raw;
+					}
 				}
 
 				// Parent bookmarks so we know what bookmark we're near / on top of
@@ -124,6 +142,20 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					parentBookmarks = "";
 				}
+
+				// Build compact PWD indicator
+				const atPart = compactBookmark(atBookmark) || changeId;
+				const parentPart = compactBookmark(parentBookmarks);
+				jjLine = parentPart ? `${atPart} ↑${parentPart}` : atPart;
+
+				// Full detail as an extension status line (doesn’t compete for PWD width)
+				const fullParent = parentBookmarks.split(/\s+/)[0] || "";
+				ctx.ui.setStatus(
+					"jj",
+					fullParent
+						? `jj: ${changeId || atBookmark} ↑ ${fullParent}`
+						: `jj: ${changeId || atBookmark}`,
+				);
 
 				tui.requestRender();
 			};
@@ -151,8 +183,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (isJjRepo && jjLine) {
-						const suffix = parentBookmarks ? ` on ${parentBookmarks}` : "";
-						pwd = `${pwd} [jj: ${jjLine}${suffix}]`;
+						pwd = `${pwd} [jj: ${jjLine}]`;
 					} else if (gitBranch) {
 						pwd = `${pwd} (${gitBranch})`;
 					}

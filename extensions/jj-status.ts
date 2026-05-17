@@ -24,15 +24,11 @@ function sanitizeStatusText(text: string): string {
 	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
 }
 
-/** Compact a jj bookmarks string: first bookmark only, last path segment, truncated */
-function compactBookmark(bookmarks: string, maxLen = 12): string {
+/** Compact a jj bookmarks string: first bookmark only, last path segment */
+function compactBookmark(bookmarks: string): string {
 	if (!bookmarks) return "";
 	const first = bookmarks.split(/\s+/)[0];
-	const lastSegment = first.includes("/") ? first.split("/").pop()! : first;
-	if (lastSegment.length > maxLen) {
-		return lastSegment.slice(0, maxLen - 1) + "…";
-	}
-	return lastSegment;
+	return first.includes("/") ? first.split("/").pop()! : first;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -92,7 +88,7 @@ export default function (pi: ExtensionAPI) {
 				isJjRepo = true;
 
 				// Compact jj status for @ (working copy):
-				//   bookmarks | change_id.shortest(8)
+				//   bookmarks | change_id.shortest(8) | desc / conflict / empty
 				const logResult = await pi
 					.exec(
 						"jj",
@@ -102,7 +98,7 @@ export default function (pi: ExtensionAPI) {
 							"@",
 							"--no-graph",
 							"--template",
-							'separate(" | ", bookmarks, change_id.shortest(8))',
+							'separate(" | ", bookmarks, change_id.shortest(8), if(conflict, "conflict", if(description, description.first_line(), "empty")))',
 						],
 						{ cwd: ctx.cwd, timeout: 3000 },
 					)
@@ -110,12 +106,17 @@ export default function (pi: ExtensionAPI) {
 
 				let atBookmark = "";
 				let changeId = "";
+				let desc = "";
 				if (logResult && logResult.code === 0) {
 					const raw = logResult.stdout.trim();
 					const parts = raw.split(" | ");
-					if (parts.length > 1) {
+					if (parts.length >= 3) {
 						atBookmark = parts[0];
 						changeId = parts[1];
+						desc = parts[2];
+					} else if (parts.length === 2) {
+						changeId = parts[0];
+						desc = parts[1];
 					} else {
 						changeId = raw;
 					}
@@ -146,15 +147,17 @@ export default function (pi: ExtensionAPI) {
 				// Build compact PWD indicator
 				const atPart = compactBookmark(atBookmark) || changeId;
 				const parentPart = compactBookmark(parentBookmarks);
-				jjLine = parentPart ? `${atPart} ↑${parentPart}` : atPart;
+				jjLine = parentPart
+					? `${atPart} | ${desc} ↑${parentPart}`
+					: `${atPart} | ${desc}`;
 
 				// Full detail as an extension status line (doesn’t compete for PWD width)
 				const fullParent = parentBookmarks.split(/\s+/)[0] || "";
 				ctx.ui.setStatus(
 					"jj",
 					fullParent
-						? `jj: ${changeId || atBookmark} ↑ ${fullParent}`
-						: `jj: ${changeId || atBookmark}`,
+						? `jj: ${changeId || atBookmark} | ${desc} ↑ ${fullParent}`
+						: `jj: ${changeId || atBookmark} | ${desc}`,
 				);
 
 				tui.requestRender();

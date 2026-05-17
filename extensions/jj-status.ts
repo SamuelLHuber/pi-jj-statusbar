@@ -20,10 +20,6 @@ function formatTokens(count: number): string {
 	return `${(count / 1000000).toFixed(1)}M`;
 }
 
-function sanitizeStatusText(text: string): string {
-	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
-}
-
 /** Compact a jj bookmarks string: first bookmark only, last path segment */
 function compactBookmark(bookmarks: string): string {
 	if (!bookmarks) return "";
@@ -150,15 +146,6 @@ export default function (pi: ExtensionAPI) {
 				jjLine = parentPart
 					? `${atPart} | ${desc} ↑${parentPart}`
 					: `${atPart} | ${desc}`;
-
-				// Full detail as an extension status line (doesn’t compete for PWD width)
-				const fullParent = parentBookmarks.split(/\s+/)[0] || "";
-				ctx.ui.setStatus(
-					"jj",
-					fullParent
-						? `jj: ${changeId || atBookmark} | ${desc} ↑ ${fullParent}`
-						: `jj: ${changeId || atBookmark} | ${desc}`,
-				);
 
 				tui.requestRender();
 			};
@@ -312,18 +299,6 @@ export default function (pi: ExtensionAPI) {
 						theme.fg("dim", "..."),
 					);
 					const lines = [pwdLine, dimStatsLeft + dimRemainder];
-
-					// Extension statuses
-					const extensionStatuses = footerData.getExtensionStatuses();
-					if (extensionStatuses.size > 0) {
-						const sortedStatuses = Array.from(extensionStatuses.entries())
-							.sort(([a], [b]) => a.localeCompare(b))
-							.map(([, text]) => sanitizeStatusText(text));
-						const statusLine = sortedStatuses.join(" ");
-						lines.push(
-							truncateToWidth(statusLine, width, theme.fg("dim", "...")),
-						);
-					}
 
 					return lines;
 				},

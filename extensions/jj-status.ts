@@ -52,6 +52,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			let isJjRepo = false;
 			let jjLine = "";
+			let parentBookmarks = "";
 			let gitBranch: string | null = null;
 
 			const refresh = async () => {
@@ -60,6 +61,7 @@ export default function (pi: ExtensionAPI) {
 				if (!hasJjCli) {
 					isJjRepo = false;
 					jjLine = "";
+					parentBookmarks = "";
 					tui.requestRender();
 					return;
 				}
@@ -71,6 +73,7 @@ export default function (pi: ExtensionAPI) {
 				if (!root || root.code !== 0) {
 					isJjRepo = false;
 					jjLine = "";
+					parentBookmarks = "";
 					tui.requestRender();
 					return;
 				}
@@ -99,6 +102,29 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					jjLine = "";
 				}
+
+				// Parent bookmarks so we know what bookmark we're near / on top of
+				const parentResult = await pi
+					.exec(
+						"jj",
+						[
+							"log",
+							"--revisions",
+							"@-",
+							"--no-graph",
+							"--template",
+							"bookmarks",
+						],
+						{ cwd: ctx.cwd, timeout: 3000 },
+					)
+					.catch(() => undefined);
+
+				if (parentResult && parentResult.code === 0) {
+					parentBookmarks = parentResult.stdout.trim();
+				} else {
+					parentBookmarks = "";
+				}
+
 				tui.requestRender();
 			};
 
@@ -125,7 +151,8 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (isJjRepo && jjLine) {
-						pwd = `${pwd} [jj: ${jjLine}]`;
+						const suffix = parentBookmarks ? ` on ${parentBookmarks}` : "";
+						pwd = `${pwd} [jj: ${jjLine}${suffix}]`;
 					} else if (gitBranch) {
 						pwd = `${pwd} (${gitBranch})`;
 					}

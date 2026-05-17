@@ -1,0 +1,9 @@
+{
+  "name": "pi-jj-statusbar",
+  "version": "1.0.0",
+  "description": "JJ-native status bar for pi — shows jj change/bookmark info when in a jj repo, falls back to git branch",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}

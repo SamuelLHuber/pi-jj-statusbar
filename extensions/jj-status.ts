@@ -13,6 +13,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+function sanitizeStatusText(text: string): string {
+	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -299,6 +303,16 @@ export default function (pi: ExtensionAPI) {
 						theme.fg("dim", "..."),
 					);
 					const lines = [pwdLine, dimStatsLeft + dimRemainder];
+
+					// Add extension statuses on a single line (same as built-in footer)
+					const extensionStatuses = footerData.getExtensionStatuses();
+					if (extensionStatuses.size > 0) {
+						const sortedStatuses = Array.from(extensionStatuses.entries())
+							.sort(([a], [b]) => a.localeCompare(b))
+							.map(([, text]) => sanitizeStatusText(text));
+						const statusLine = sortedStatuses.join(" ");
+						lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+					}
 
 					return lines;
 				},

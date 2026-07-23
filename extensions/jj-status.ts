@@ -30,6 +30,10 @@ function compactBookmark(bookmarks: string): string {
 	return first.includes("/") ? first.split("/").pop()! : first;
 }
 
+const JJ_TIMEOUT_MS = 1000;
+const POLL_INTERVAL_MS = 30_000;
+const ERROR_BACKOFF_MS = 120_000;
+
 export default function (pi: ExtensionAPI) {
 	let enabled = true;
 
@@ -60,53 +64,70 @@ export default function (pi: ExtensionAPI) {
 			let jjLine = "";
 			let parentBookmarks = "";
 			let gitBranch: string | null = null;
+			let refreshInFlight = false;
+			let backoffUntilMs = 0;
 
 			const refresh = async () => {
-				gitBranch = footerData.getGitBranch();
+				if (refreshInFlight) return;
 
-				if (!hasJjCli) {
-					isJjRepo = false;
-					jjLine = "";
-					parentBookmarks = "";
-					tui.requestRender();
-					return;
-				}
+				const now = Date.now();
+				if (backoffUntilMs > now) return;
 
-				const root = await pi
-					.exec("jj", ["root"], { cwd: ctx.cwd, timeout: 3000 })
-					.catch(() => undefined);
+				refreshInFlight = true;
+				try {
+					gitBranch = footerData.getGitBranch();
 
-				if (!root || root.code !== 0) {
-					isJjRepo = false;
-					jjLine = "";
-					parentBookmarks = "";
-					tui.requestRender();
-					return;
-				}
+					if (!hasJjCli) {
+						isJjRepo = false;
+						jjLine = "";
+						parentBookmarks = "";
+						tui.requestRender();
+						return;
+					}
 
-				isJjRepo = true;
+					const root = await pi
+						.exec("jj", ["--ignore-working-copy", "root"], {
+							cwd: ctx.cwd,
+							timeout: JJ_TIMEOUT_MS,
+						})
+						.catch(() => undefined);
 
-				// Compact jj status for @ (working copy):
-				//   bookmarks | change_id.shortest(8) | desc / conflict / empty
-				const logResult = await pi
-					.exec(
-						"jj",
-						[
-							"log",
-							"--revisions",
-							"@",
-							"--no-graph",
-							"--template",
-							'separate(" | ", bookmarks, change_id.shortest(8), if(conflict, "conflict", if(description, description.first_line(), "empty")))',
-						],
-						{ cwd: ctx.cwd, timeout: 3000 },
-					)
-					.catch(() => undefined);
+					if (!root || root.code !== 0) {
+						isJjRepo = false;
+						jjLine = "";
+						parentBookmarks = "";
+						tui.requestRender();
+						return;
+					}
 
-				let atBookmark = "";
-				let changeId = "";
-				let desc = "";
-				if (logResult && logResult.code === 0) {
+					isJjRepo = true;
+
+					// Compact jj status for @ (working copy):
+					//   bookmarks | change_id.shortest(8) | desc / conflict / empty
+					const logResult = await pi
+						.exec(
+							"jj",
+							[
+								"--ignore-working-copy",
+								"log",
+								"--revisions",
+								"@",
+								"--no-graph",
+								"--template",
+								'separate(" | ", bookmarks, change_id.shortest(8), if(conflict, "conflict", if(description, description.first_line(), "empty")))',
+							],
+							{ cwd: ctx.cwd, timeout: JJ_TIMEOUT_MS },
+						)
+						.catch(() => undefined);
+
+					if (!logResult || logResult.code !== 0) {
+						backoffUntilMs = Date.now() + ERROR_BACKOFF_MS;
+						return;
+					}
+
+					let atBookmark = "";
+					let changeId = "";
+					let desc = "";
 					const raw = logResult.stdout.trim();
 					const parts = raw.split(" | ");
 					if (parts.length >= 3) {
@@ -119,42 +140,45 @@ export default function (pi: ExtensionAPI) {
 					} else {
 						changeId = raw;
 					}
+
+					// Parent bookmarks so we know what bookmark we're near / on top of
+					const parentResult = await pi
+						.exec(
+							"jj",
+							[
+								"--ignore-working-copy",
+								"log",
+								"--revisions",
+								"@-",
+								"--no-graph",
+								"--template",
+								"bookmarks",
+							],
+							{ cwd: ctx.cwd, timeout: JJ_TIMEOUT_MS },
+						)
+						.catch(() => undefined);
+
+					if (parentResult && parentResult.code === 0) {
+						parentBookmarks = parentResult.stdout.trim();
+					} else {
+						parentBookmarks = "";
+					}
+
+					// Build compact PWD indicator
+					const atPart = compactBookmark(atBookmark) || changeId;
+					const parentPart = compactBookmark(parentBookmarks);
+					jjLine = parentPart
+						? `${atPart} | ${desc} ↑${parentPart}`
+						: `${atPart} | ${desc}`;
+
+					tui.requestRender();
+				} finally {
+					refreshInFlight = false;
 				}
-
-				// Parent bookmarks so we know what bookmark we're near / on top of
-				const parentResult = await pi
-					.exec(
-						"jj",
-						[
-							"log",
-							"--revisions",
-							"@-",
-							"--no-graph",
-							"--template",
-							"bookmarks",
-						],
-						{ cwd: ctx.cwd, timeout: 3000 },
-					)
-					.catch(() => undefined);
-
-				if (parentResult && parentResult.code === 0) {
-					parentBookmarks = parentResult.stdout.trim();
-				} else {
-					parentBookmarks = "";
-				}
-
-				// Build compact PWD indicator
-				const atPart = compactBookmark(atBookmark) || changeId;
-				const parentPart = compactBookmark(parentBookmarks);
-				jjLine = parentPart
-					? `${atPart} | ${desc} ↑${parentPart}`
-					: `${atPart} | ${desc}`;
-
-				tui.requestRender();
 			};
 
 			refresh();
-			const pollTimer = setInterval(refresh, 3000);
+			const pollTimer = setInterval(refresh, POLL_INTERVAL_MS);
 
 			const unsubBranch = footerData.onBranchChange(() => {
 				refresh();

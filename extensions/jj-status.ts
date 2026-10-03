@@ -1,345 +1,70 @@
-/**
- * JJ-Native Status Bar Extension for pi
- *
- * Upgrades the footer repo indicator to be jj-native when `jj` is present,
- * falling back to git branch display when only git is available.
- *
- * Install: copy to ~/.pi/agent/extensions/jj-status.ts (auto-discovered)
- * Test:    pi -e ~/.pi/agent/extensions/jj-status.ts
- * Toggle:  /jj-status
- */
+/** JJ status alongside Pi's native footer, without snapshotting the working copy. */
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-
-function sanitizeStatusText(text: string): string {
-	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
-}
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-/** Compact a jj bookmarks string: first bookmark only, last path segment */
-function compactBookmark(bookmarks: string): string {
-	if (!bookmarks) return "";
-	const first = bookmarks.split(/\s+/)[0];
-	return first.includes("/") ? first.split("/").pop()! : first;
-}
-
-const JJ_TIMEOUT_MS = 1000;
 const POLL_INTERVAL_MS = 30_000;
 const ERROR_BACKOFF_MS = 120_000;
 
 export default function (pi: ExtensionAPI) {
 	let enabled = true;
+	let timer: ReturnType<typeof setInterval> | undefined;
+	let generation = 0;
+	let context: ExtensionContext | undefined;
+	let refreshCurrent: (() => Promise<void>) | undefined;
 
+	function stop() {
+		generation++;
+		if (timer !== undefined) clearInterval(timer);
+		timer = undefined;
+		refreshCurrent = undefined;
+	}
+	async function start(ctx: ExtensionContext) {
+		stop();
+		context = ctx;
+		if (!enabled || ctx.mode !== "tui") return;
+		const ownGeneration = generation;
+		let inFlight = false;
+		let backoffUntil = 0;
+		const refresh = async () => {
+			if (inFlight || ownGeneration !== generation || Date.now() < backoffUntil) return;
+			inFlight = true;
+			try {
+				const result = await pi.exec("jj", ["--ignore-working-copy", "log", "--revisions", "@", "--no-graph", "--template",
+					'separate(" | ", bookmarks, change_id.shortest(8), if(conflict, "conflict", if(description, description.first_line(), "empty")))'],
+					{ cwd: ctx.cwd, timeout: 1000 });
+				if (ownGeneration !== generation) return;
+				if (result.code !== 0) {
+					backoffUntil = Date.now() + ERROR_BACKOFF_MS;
+					ctx.ui.setStatus("jj-status", undefined);
+					return;
+				}
+				const text = result.stdout.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+				ctx.ui.setStatus("jj-status", `jj: ${text}`);
+			} catch {
+				if (ownGeneration === generation) {
+					backoffUntil = Date.now() + ERROR_BACKOFF_MS;
+					ctx.ui.setStatus("jj-status", undefined);
+				}
+			} finally { inFlight = false; }
+		};
+		refreshCurrent = refresh;
+		await refresh();
+		if (ownGeneration !== generation) return;
+		timer = setInterval(() => { void refresh(); }, POLL_INTERVAL_MS);
+		timer.unref();
+	}
+
+	pi.on("session_start", (_event, ctx) => start(ctx));
+	pi.on("session_tree", (_event, ctx) => start(ctx));
+	pi.on("agent_settled", () => refreshCurrent?.());
+	pi.on("session_shutdown", () => { stop(); context?.ui.setStatus("jj-status", undefined); context = undefined; });
 	pi.registerCommand("jj-status", {
-		description: "Toggle jj-native status bar",
+		description: "Toggle jj-native status",
 		handler: async (_args, ctx) => {
 			enabled = !enabled;
-			ctx.ui.notify(`JJ-native footer ${enabled ? "enabled" : "disabled"}`, "info");
-			if (!enabled) {
-				ctx.ui.setFooter(undefined);
-			} else {
-				ctx.ui.notify("Run /reload to re-apply", "info");
-			}
+			stop();
+			ctx.ui.setStatus("jj-status", undefined);
+			if (enabled) await start(ctx);
+			ctx.ui.notify(`JJ status ${enabled ? "enabled" : "disabled"}`, "info");
 		},
-	});
-
-	pi.on("session_start", async (_event, ctx) => {
-		if (!enabled) return;
-
-		// Check if jj CLI is installed
-		const jjVersion = await pi
-			.exec("jj", ["--version"], { cwd: ctx.cwd, timeout: 3000 })
-			.catch(() => undefined);
-		const hasJjCli = jjVersion && jjVersion.code === 0;
-
-		ctx.ui.setFooter((tui, theme, footerData) => {
-			let isJjRepo = false;
-			let jjLine = "";
-			let parentBookmarks = "";
-			let gitBranch: string | null = null;
-			let refreshInFlight = false;
-			let backoffUntilMs = 0;
-
-			const refresh = async () => {
-				if (refreshInFlight) return;
-
-				const now = Date.now();
-				if (backoffUntilMs > now) return;
-
-				refreshInFlight = true;
-				try {
-					gitBranch = footerData.getGitBranch();
-
-					if (!hasJjCli) {
-						isJjRepo = false;
-						jjLine = "";
-						parentBookmarks = "";
-						tui.requestRender();
-						return;
-					}
-
-					const root = await pi
-						.exec("jj", ["--ignore-working-copy", "root"], {
-							cwd: ctx.cwd,
-							timeout: JJ_TIMEOUT_MS,
-						})
-						.catch(() => undefined);
-
-					if (!root || root.code !== 0) {
-						isJjRepo = false;
-						jjLine = "";
-						parentBookmarks = "";
-						tui.requestRender();
-						return;
-					}
-
-					isJjRepo = true;
-
-					// Compact jj status for @ (working copy):
-					//   bookmarks | change_id.shortest(8) | desc / conflict / empty
-					const logResult = await pi
-						.exec(
-							"jj",
-							[
-								"--ignore-working-copy",
-								"log",
-								"--revisions",
-								"@",
-								"--no-graph",
-								"--template",
-								'separate(" | ", bookmarks, change_id.shortest(8), if(conflict, "conflict", if(description, description.first_line(), "empty")))',
-							],
-							{ cwd: ctx.cwd, timeout: JJ_TIMEOUT_MS },
-						)
-						.catch(() => undefined);
-
-					if (!logResult || logResult.code !== 0) {
-						backoffUntilMs = Date.now() + ERROR_BACKOFF_MS;
-						return;
-					}
-
-					let atBookmark = "";
-					let changeId = "";
-					let desc = "";
-					const raw = logResult.stdout.trim();
-					const parts = raw.split(" | ");
-					if (parts.length >= 3) {
-						atBookmark = parts[0];
-						changeId = parts[1];
-						desc = parts[2];
-					} else if (parts.length === 2) {
-						changeId = parts[0];
-						desc = parts[1];
-					} else {
-						changeId = raw;
-					}
-
-					// Parent bookmarks so we know what bookmark we're near / on top of
-					const parentResult = await pi
-						.exec(
-							"jj",
-							[
-								"--ignore-working-copy",
-								"log",
-								"--revisions",
-								"@-",
-								"--no-graph",
-								"--template",
-								"bookmarks",
-							],
-							{ cwd: ctx.cwd, timeout: JJ_TIMEOUT_MS },
-						)
-						.catch(() => undefined);
-
-					if (parentResult && parentResult.code === 0) {
-						parentBookmarks = parentResult.stdout.trim();
-					} else {
-						parentBookmarks = "";
-					}
-
-					// Build compact PWD indicator
-					const atPart = compactBookmark(atBookmark) || changeId;
-					const parentPart = compactBookmark(parentBookmarks);
-					jjLine = parentPart
-						? `${atPart} | ${desc} ↑${parentPart}`
-						: `${atPart} | ${desc}`;
-
-					tui.requestRender();
-				} finally {
-					refreshInFlight = false;
-				}
-			};
-
-			refresh();
-			const pollTimer = setInterval(refresh, POLL_INTERVAL_MS);
-
-			const unsubBranch = footerData.onBranchChange(() => {
-				refresh();
-				tui.requestRender();
-			});
-
-			return {
-				dispose() {
-					clearInterval(pollTimer);
-					unsubBranch();
-				},
-				invalidate() {},
-				render(width: number): string[] {
-					// ── PWD line ─────────────────────────────────────────────
-					let pwd = ctx.sessionManager.getCwd();
-					const home = process.env.HOME || process.env.USERPROFILE;
-					if (home && pwd.startsWith(home)) {
-						pwd = `~${pwd.slice(home.length)}`;
-					}
-
-					if (isJjRepo && jjLine) {
-						pwd = `${pwd} [jj: ${jjLine}]`;
-					} else if (gitBranch) {
-						pwd = `${pwd} (${gitBranch})`;
-					}
-
-					const sessionName = ctx.sessionManager.getSessionName();
-					if (sessionName) {
-						pwd = `${pwd} • ${sessionName}`;
-					}
-
-					// ── Stats line ───────────────────────────────────────────
-					let totalInput = 0,
-						totalOutput = 0,
-						totalCacheRead = 0,
-						totalCacheWrite = 0,
-						totalCost = 0;
-
-					for (const e of ctx.sessionManager.getEntries()) {
-						if (e.type === "message" && e.message.role === "assistant") {
-							const { usage } = e.message;
-							totalInput += usage.input;
-							totalOutput += usage.output;
-							totalCacheRead += usage.cacheRead;
-							totalCacheWrite += usage.cacheWrite;
-							totalCost += usage.cost.total;
-						}
-					}
-
-					const statsParts: string[] = [];
-					if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
-					if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
-					if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
-					if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
-
-					const usingSubscription =
-						ctx.model && ctx.modelRegistry.isUsingOAuth(ctx.model);
-					if (totalCost || usingSubscription) {
-						statsParts.push(
-							`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`,
-						);
-					}
-
-					const contextUsage = ctx.getContextUsage();
-					const contextWindow =
-						contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-					const contextPercentValue = contextUsage?.percent ?? 0;
-					const contextPercent =
-						contextUsage?.percent !== null
-							? contextPercentValue.toFixed(1)
-							: "?";
-
-					let contextPercentStr: string;
-					const contextPercentDisplay =
-						contextPercent === "?"
-							? `?/${formatTokens(contextWindow)}`
-							: `${contextPercent}%/${formatTokens(contextWindow)}`;
-
-					if (contextPercentValue > 90) {
-						contextPercentStr = theme.fg("error", contextPercentDisplay);
-					} else if (contextPercentValue > 70) {
-						contextPercentStr = theme.fg("warning", contextPercentDisplay);
-					} else {
-						contextPercentStr = contextPercentDisplay;
-					}
-					statsParts.push(contextPercentStr);
-
-					let statsLeft = statsParts.join(" ");
-					const statsLeftWidth = visibleWidth(statsLeft);
-
-					// Model / provider on the right
-					const modelName = ctx.model?.id || "no-model";
-					let rightSideWithoutProvider = modelName;
-
-					if (ctx.model?.reasoning) {
-						rightSideWithoutProvider = `${modelName} • reasoning`;
-					}
-
-					let rightSide = rightSideWithoutProvider;
-					if (
-						footerData.getAvailableProviderCount() > 1 &&
-						ctx.model
-					) {
-						rightSide = `(${ctx.model.provider}) ${rightSideWithoutProvider}`;
-						if (statsLeftWidth + 2 + visibleWidth(rightSide) > width) {
-							rightSide = rightSideWithoutProvider;
-						}
-					}
-
-					const rightSideWidth = visibleWidth(rightSide);
-					const totalNeeded = statsLeftWidth + 2 + rightSideWidth;
-
-					let statsLine: string;
-					if (totalNeeded <= width) {
-						const padding = " ".repeat(
-							width - statsLeftWidth - rightSideWidth,
-						);
-						statsLine = statsLeft + padding + rightSide;
-					} else {
-						const availableForRight = width - statsLeftWidth - 2;
-						if (availableForRight > 0) {
-							const truncatedRight = truncateToWidth(
-								rightSide,
-								availableForRight,
-								"",
-							);
-							const truncatedRightWidth = visibleWidth(truncatedRight);
-							const padding = " ".repeat(
-								Math.max(0, width - statsLeftWidth - truncatedRightWidth),
-							);
-							statsLine = statsLeft + padding + truncatedRight;
-						} else {
-							statsLine = statsLeft;
-						}
-					}
-
-					// Dim separately so inner color codes (context %) aren't wiped
-					const dimStatsLeft = theme.fg("dim", statsLeft);
-					const remainder = statsLine.slice(statsLeft.length);
-					const dimRemainder = theme.fg("dim", remainder);
-
-					const pwdLine = truncateToWidth(
-						theme.fg("dim", pwd),
-						width,
-						theme.fg("dim", "..."),
-					);
-					const lines = [pwdLine, dimStatsLeft + dimRemainder];
-
-					// Add extension statuses on a single line (same as built-in footer)
-					const extensionStatuses = footerData.getExtensionStatuses();
-					if (extensionStatuses.size > 0) {
-						const sortedStatuses = Array.from(extensionStatuses.entries())
-							.sort(([a], [b]) => a.localeCompare(b))
-							.map(([, text]) => sanitizeStatusText(text));
-						const statusLine = sortedStatuses.join(" ");
-						lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
-					}
-
-					return lines;
-				},
-			};
-		});
 	});
 }
